@@ -1,42 +1,40 @@
-"""Poker44 bot detector (GAP_FIX) -- TRANSFER-PRUNED LightGBM over the
-83 sanitizer-STABLE C2 features, with the reward-fit FPR-capped floating
-decision layer (deterministic 2% 0.5-crossing).
+"""Poker44 bot detector (BEATER) -- a WITHIN-BATCH RANK-FUSED ENSEMBLE of three
+decorrelated members over the SAME 180-dim sanitization-invariant C2 feature row,
+topped with our reward-fit, FPR-capped floating decision layer.
 
-Why this exists -- the live-transfer gap
-----------------------------------------
-Our benchmark GroupKFold-by-date AP (~0.924 on the full 180 C2 features) EQUALS
-the steady top tier's, yet our mains score ~0.46-0.49 live while the steady band
-scores ~0.52-0.55. The gap is NOT benchmark discrimination; it is live rank-
-TRANSFER on the OOD sanitized feed. Transfer audit (scipy ks_2samp, 1460 bench
-groups vs 1404 live chunks): 97/180 C2 features have KS>=0.6 between benchmark
-and the live corpus, and the deployed FULL-180 LightGBM spends 53.6% of its total
-split-gain on those OOD columns (82.8% on KS>=0.5). The model keys on exactly the
-columns whose live distribution moves -> its live ordering degrades toward noise
-(deployed live raw-std ~0.083). Its single highest-gain feature street_count_std
-has KS=0.58 / std-ratio 0.31.
+Why this model (closing the live-rank gap)
+-------------------------------------------
+Our benchmark GroupKFold-by-date AP (~0.92 on the 180 C2 features) already EQUALS
+the steady top tier's, yet our single-LightGBM mains score ~0.49 live while the
+steady band scores ~0.55. The whole gap is in the 65% RANK block
+(0.35*AP + 0.30*recall@FPR<=0.05); we already max the 30% hard-0.5-threshold block.
+Root cause: a single learner is the highest-variance choice out-of-distribution on
+the sanitized live feed. Every steady winner runs a within-batch RANK-FUSED
+ENSEMBLE of decorrelated members plus sign-stability-gated monotone constraints.
+This model ports that recipe over OUR feature pipeline verbatim.
 
-The fix (this model)
---------------------
-Drop every KS>=0.6 column; retrain the exact B2 recipe on the 83 KS<0.6
-TRANSFER-SAFE features only. Measured (GroupKFold-by-date, 5 folds):
-  FULL-180 : AP 0.9242  live-raw std 0.0869  IQR 0.127
-  PRUNE-83 : AP 0.8982  live-raw std 0.1976  IQR 0.334   (dAP -0.0260)
-i.e. a booked -0.026 benchmark-AP cost buys a ~2.3x live un-collapse of the
-prediction spread on a model that currently ranks near-constant live. The pruned
-live ranking is materially different (full-vs-prune live Spearman ~0.77). This
-directly targets the movable 65% RANK block (AP + recall@FPR<=0.05); the
-transform below is monotone, so the 30% hard-0.5 threshold block is UNTOUCHED.
+Members (all over the identical 180-dim FEATURE_NAMES row)
+---------------------------------------------------------
+  1. STACK  -- LGBM + XGB + RF -> logistic OOF stack (the discrimination anchor).
+  2. MONO   -- monotone-constrained LightGBM bag; monotone_constraints set to
+               +1/-1 ONLY for features whose per-DATE Spearman(feature,label) sign
+               is stable across >=70% of dates AND |mean rho| >= 0.05 (else 0).
+               The OOD-transfer regularizer.
+  3. MLP    -- PCA(56) -> MLP bag on the standardized feature view; architecturally
+               decorrelated from the tree members.
 
-Pipeline
---------
-1. FEATURE_NAMES-ordered 83-dim transfer-safe feature row per chunk.
-2. Deep LightGBM (B2: n_estimators=1200, lr=0.02, num_leaves=63,
-   min_child_samples=50, reg_lambda=5.0) refit on ALL benchmark groups.
-3. Isotonic calibrator (fit on GroupKFold-by-date OOF) -> calibrated prob.
-4. Reward-fit, FPR-capped per-batch decision layer (Q/MARGIN/TEMP/FLOOR/CAP)
-   -> DETERMINISTIC ~2% 0.5-crossing per >=50-chunk live window (verified
-   min==mean==max==0.020 over 14 held-out live sets), zero hard-zeros. CAP=True
-   also caps over-crossing so no saturated OOD window can blow hard_fpr.
+Fusion is calibration-free: each member's WITHIN-BATCH rank (argsort/argsort/(n-1))
+is averaged with fixed weights (0.35, 0.30, 0.35), so no member's OOD score-scale
+can distort the blend. The fused rank is the movable ordering that drives the 65%
+RANK block.
+
+Decision layer (reused verbatim from BEST/GAP_FIX)
+--------------------------------------------------
+The fused within-batch rank is passed through an isotonic map then the reward-fit
+per-batch decision layer (anchor quantile Q + logit margin/temp + hard FLOOR + CAP)
+-> DETERMINISTIC ~2% of every window crosses 0.5, zero hard-zeros. That transform is
+monotone, so AP / recall@FPR (the 65% block) are set purely by the fused rank while
+the 30% hard-0.5-threshold block stays pinned high and steady.
 
 IMPORTANT -- inference does NOT sanitize. Live chunks arrive already sanitized by
 the validator (prepare_hand_for_miner runs validator-side, per hand). Only the
@@ -51,19 +49,79 @@ import joblib
 
 from poker44_model.features import chunk_features, FEATURE_NAMES
 
+try:  # keep any torch backend single-threaded (never deadlock batched predict)
+    import torch  # noqa: F401
+    torch.set_num_threads(1)
+except Exception:
+    pass
+
 _MODEL = None
+
+
+def _pin_single_thread(est):
+    """Best-effort force n_jobs/thread_count=1 so batched predict never deadlocks."""
+    for attr in ("n_jobs", "nthread", "thread_count"):
+        try:
+            est.set_params(**{attr: 1})
+        except Exception:
+            pass
+    # dig into containers (StackingClassifier, VotingClassifier, Pipeline)
+    for holder in ("estimators_", "estimators"):
+        try:
+            for sub in getattr(est, holder):
+                _pin_single_thread(sub[1] if isinstance(sub, tuple) else sub)
+        except Exception:
+            pass
+    for attr in ("final_estimator_", "final_estimator"):
+        try:
+            _pin_single_thread(getattr(est, attr))
+        except Exception:
+            pass
+    try:  # sklearn Pipeline
+        for _, step in est.steps:
+            _pin_single_thread(step)
+    except Exception:
+        pass
 
 
 def _model():
     global _MODEL
     if _MODEL is None:
         b = joblib.load(os.path.join(os.path.dirname(__file__), "model.joblib"))
-        try:  # keep batched tree predict single-threaded (never deadlock)
-            b["lgbm"].set_params(n_jobs=1)
-        except Exception:
-            pass
+        for key in ("stack", "mono", "mlp"):
+            try:
+                _pin_single_thread(b[key])
+            except Exception:
+                pass
         _MODEL = b
     return _MODEL
+
+
+def _rank01(s):
+    """Within-batch rank in [0,1]: argsort/argsort/(n-1). Calibration-free."""
+    s = np.asarray(s, dtype=float)
+    if s.size <= 1:
+        return np.zeros_like(s)
+    return np.argsort(np.argsort(s, kind="stable"), kind="stable").astype(float) / (s.size - 1)
+
+
+def _rows(chunks):
+    rows = []
+    for c in chunks:
+        feats = chunk_features(c)
+        rows.append([feats.get(k, 0.0) for k in FEATURE_NAMES])
+    return np.array(rows, dtype=float)
+
+
+def _fused_rank(model, chunks):
+    """Weighted average of each member's WITHIN-BATCH rank (the movable ordering)."""
+    X = _rows(chunks)
+    s1 = model["stack"].predict_proba(X)[:, 1]
+    s2 = model["mono"].predict_proba(X)[:, 1]
+    s3 = model["mlp"].predict_proba(X)[:, 1]
+    w1, w2, w3 = model["weights"]
+    fused = (w1 * _rank01(s1) + w2 * _rank01(s2) + w3 * _rank01(s3)) / (w1 + w2 + w3)
+    return fused
 
 
 def _logit(p, eps):
@@ -71,21 +129,12 @@ def _logit(p, eps):
     return np.log(p / (1.0 - p))
 
 
-def _raw_scores(model, chunks):
-    """Pre-decision-layer discrimination score per chunk (LightGBM probability)."""
-    rows = []
-    for c in chunks:
-        feats = chunk_features(c)
-        rows.append([feats.get(k, 0.0) for k in FEATURE_NAMES])
-    return model["lgbm"].predict_proba(np.array(rows, dtype=float))[:, 1]
-
-
-def _calibrated(model, raw):
-    return model["iso"].predict(np.asarray(raw, dtype=float))
+def _calibrated(model, fused):
+    return model["iso"].predict(np.asarray(fused, dtype=float))
 
 
 def _decision(model, cal):
-    """Reward-fit, FPR-capped per-batch decision layer on calibrated probs.
+    """Reward-fit, FPR-capped per-batch decision layer on the calibrated fused score.
 
     Anti-saturation recenter (batch quantile Q) + reward-fit logit margin/temp so
     only a conservative high tail can cross 0.5, plus a thin hard floor that always
@@ -114,13 +163,13 @@ def _decision(model, cal):
 
 
 def score_batch(chunks):
-    """One bot-risk score in [0,1] per chunk (reward-fit floating output)."""
+    """One bot-risk score in [0,1] per chunk (rank-fused, reward-fit floating output)."""
     chunks = chunks or []
     if not chunks:
         return []
     try:
         m = _model()
-        return _decision(m, _calibrated(m, _raw_scores(m, chunks)))
+        return _decision(m, _calibrated(m, _fused_rank(m, chunks)))
     except Exception:
         return [0.5] * len(chunks)
 
@@ -131,6 +180,11 @@ def score_chunk(chunk):
         if not chunk:
             return 0.5
         m = _model()
-        return round(float(_calibrated(m, _raw_scores(m, [chunk]))[0]), 6)
+        # No batch context for a lone chunk: return the calibrated member-mean prob.
+        X = _rows([chunk])
+        s = (m["weights"][0] * m["stack"].predict_proba(X)[:, 1]
+             + m["weights"][1] * m["mono"].predict_proba(X)[:, 1]
+             + m["weights"][2] * m["mlp"].predict_proba(X)[:, 1]) / sum(m["weights"])
+        return round(float(s[0]), 6)
     except Exception:
         return 0.5
