@@ -218,3 +218,8 @@ miner.env
 
 # Poker44 fork: captured live eval chunks/scores (runtime output)
 poker44_model/captures/
+**/__pycache__/
+*.pyc
+_bench_cache.npz
+*_cache.npz
+_train.log
