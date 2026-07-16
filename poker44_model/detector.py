@@ -20,11 +20,11 @@ Members (all over the identical 180-dim FEATURE_NAMES row)
                +1/-1 ONLY for features whose per-DATE Spearman(feature,label) sign
                is stable across >=70% of dates AND |mean rho| >= 0.05 (else 0).
                The OOD-transfer regularizer.
-  3. MLP    -- PCA(56) -> MLP bag on the standardized feature view; architecturally
+  3. MLP    -- PCA(52) -> MLP(72,) bag on the standardized feature view; architecturally
                decorrelated from the tree members.
 
 Fusion is calibration-free: each member's WITHIN-BATCH rank (argsort/argsort/(n-1))
-is averaged with fixed weights (0.35, 0.30, 0.35), so no member's OOD score-scale
+is averaged with fixed weights (0.40, 0.25, 0.35), so no member's OOD score-scale
 can distort the blend. The fused rank is the movable ordering that drives the 65%
 RANK block.
 

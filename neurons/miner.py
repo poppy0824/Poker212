@@ -49,12 +49,12 @@ class Miner(BaseMinerNeuron):
             repo_root=repo_root,
             implementation_files=implementation_files,
             defaults={
-                "model_name": "poker212-v2",
+                "model_name": "poker212-ens2",
                 "model_version": "1",
                 "framework": "lightgbm+sklearn-ensemble",
                 "license": "MIT",
                 "repo_url": "",
-                "notes": "Gradient-boosted-trees bot detector over transfer-stable behavioral features (poker44_model/).",
+                "notes": "Rank-fused ensemble (stacked GBDT + sign-stable monotone LGBM + PCA->MLP) over 180 sanitization-invariant behavioral features (poker44_model/); strictly-monotone reward-fit decision layer, deterministic top-10% crossing, no isotonic calibration.",
                 "open_source": True,
                 "inference_mode": "remote",
                 "training_data_statement": (
