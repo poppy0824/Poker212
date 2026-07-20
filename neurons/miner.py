@@ -37,7 +37,9 @@ class Miner(BaseMinerNeuron):
             Path(__file__).resolve(),
             repo_root / "poker44_model" / "__init__.py",
             repo_root / "poker44_model" / "detector.py",
-            repo_root / "poker44_model" / "features.py",
+            repo_root / "poker44_model" / "union_features.py",
+            repo_root / "poker44_model" / "features_v2.py",
+            repo_root / "poker44_model" / "base_features.py",
             repo_root / "poker44_model" / "model.joblib",
             repo_root / "poker44_model" / "capture.py",
         ]

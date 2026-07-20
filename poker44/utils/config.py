@@ -190,4 +190,21 @@ def check_config(cls, config: "bt.Config"):
 def config(cls) -> bt.Config:
     parser = argparse.ArgumentParser()
     cls.add_args(parser)
-    return bt.Config(parser=parser)
+    conf = bt.Config(parser=parser)
+    # bittensor >=10.4 (async-substrate-interface 2.x, required by the upgraded chain
+    # runtime) changed bt.Config(parser=...) to stop populating from argv — it returns
+    # only defaults and drops the fork's custom args (--netuid, --neuron.*), leaving
+    # config.neuron None. Re-parse the full arg set and merge every value with dotted
+    # nesting so the CLI flags take effect again. No-op under 10.2.x (identical values).
+    known, _ = parser.parse_known_args()
+    for dest, val in vars(known).items():
+        parts = dest.split(".")
+        node = conf
+        for p in parts[:-1]:
+            if getattr(node, p, None) is None:
+                setattr(node, p, bt.Config())
+            node = getattr(node, p)
+        setattr(node, parts[-1], val)
+    if getattr(conf, "neuron", None) is not None and getattr(conf.neuron, "name", None) is None:
+        conf.neuron.name = "miner"
+    return conf
